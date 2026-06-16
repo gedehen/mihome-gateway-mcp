@@ -1,0 +1,14 @@
+[Unit]
+Description=Mi Home Gateway Daemon (mgwd)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/mgwd --jsdir __JS_DIR__
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

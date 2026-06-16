@@ -1,0 +1,17 @@
+# 二进制
+bin/
+
+# Go
+*.exe
+*.test
+*.out
+
+# Node
+node_modules/
+package-lock.json
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
