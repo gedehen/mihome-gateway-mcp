@@ -467,8 +467,9 @@ func writeFile(path string, content string, perm os.FileMode) {
 	os.WriteFile(path, []byte(content), perm)
 }
 
+// hermesHome 返回根 hermes 目录（~/.hermes）
+// mihome 配置文件始终在根目录，不在 profile 子目录
 func hermesHome() string {
-	if h := os.Getenv("HERMES_HOME"); h != "" { return h }
 	return filepath.Join(os.Getenv("HOME"), ".hermes")
 }
 func passcodeFilePath() string { return filepath.Join(hermesHome(), "mihome", "passcode") }

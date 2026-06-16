@@ -198,18 +198,19 @@ func (c *Connection) sendProtocolList() error {
 }
 
 func (c *Connection) doECJPAKE(ctx context.Context) error {
+	// 客户端先发 R1（对标 gateway.js setPasscode → writeRoundOne → send）
 	ec, err := NewECJPAKE("client", c.passcode)
 	if err != nil {
 		return err
 	}
 
-	// R1 发送
+	// 1. 客户端发送 R1
 	r1, _ := ec.WriteRoundOne()
 	if err := c.writeBin(append([]byte{dataTypeECJPAKERoundOne}, r1...)); err != nil {
 		return fmt.Errorf("send R1: %w", err)
 	}
 
-	// R1 接收
+	// 2. 接收服务器 R1
 	serverR1, err := c.waitForPayload(ctx, dataTypeECJPAKERoundOne, 5*time.Second)
 	if err != nil {
 		return fmt.Errorf("recv R1: %w", err)
@@ -218,13 +219,13 @@ func (c *Connection) doECJPAKE(ctx context.Context) error {
 		return fmt.Errorf("read R1: %w", err)
 	}
 
-	// R2 发送
+	// 3. 客户端发送 R2
 	r2, _ := ec.WriteRoundTwo()
 	if err := c.writeBin(append([]byte{dataTypeECJPAKERoundTwo}, r2...)); err != nil {
 		return fmt.Errorf("send R2: %w", err)
 	}
 
-	// R2 接收
+	// 4. 接收服务器 R2 → 共享密钥
 	serverR2, err := c.waitForPayload(ctx, dataTypeECJPAKERoundTwo, 5*time.Second)
 	if err != nil {
 		return fmt.Errorf("recv R2: %w", err)
