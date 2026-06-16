@@ -1,13 +1,7 @@
 // mgwd — Go 重写的 Mi Home Gateway Daemon
 //
-// 替代 daemon.mjs，通过 stdin/stdout 管理 gateway.js 子进程，
-// 暴露 TCP JSON-RPC 接口 (:19345)。
-//
-// 用法:
-//
-//	mgwd --host 192.168.1.x --passcode 123456
-//	mgwd --host 192.168.1.x --jsdir /path/to/mi_gateway_js
-//	mgwd --host 192.168.1.x --native  # Go 原生协议（无需 Node.js）
+// --native 模式：Go 原生协议，零 Node.js 依赖
+// 默认模式：通过 stdin/stdout 管理 daemon.mjs 子进程
 package main
 
 import (
@@ -33,8 +27,8 @@ var (
 	flagHost     = flag.String("host", "", "Gateway IP (overrides MGW_HOST env)")
 	flagPasscode = flag.String("passcode", "", "6-digit dynamic password (overrides MGW_PASSCODE env)")
 	flagTCPAddr  = flag.String("addr", "127.0.0.1:19345", "TCP listen address")
-	flagJsDir    = flag.String("jsdir", "", "daemon.mjs directory (auto-detected if empty)")
-	flagNative   = flag.Bool("native", false, "use Go native protocol (no Node.js required)")
+	flagJsDir    = flag.String("jsdir", "", "daemon.mjs directory (for legacy mode)")
+	flagNative   = flag.Bool("native", false, "use Go native protocol (no Node.js)")
 	flagVerbose  = flag.Bool("v", false, "verbose logging")
 )
 
@@ -42,7 +36,6 @@ var logger *slog.Logger
 
 func main() {
 	flag.Parse()
-
 	level := slog.LevelInfo
 	if *flagVerbose {
 		level = slog.LevelDebug
@@ -51,21 +44,17 @@ func main() {
 
 	host := *flagHost
 	if host == "" {
-		host = os.Getenv("MGW_HOST")
+		host = envOrFile("MGW_HOST", hostFilePath())
 	}
 	passcode := *flagPasscode
 	if passcode == "" {
-		passcode = os.Getenv("MGW_PASSCODE")
+		passcode = envOrFile("MGW_PASSCODE", passcodeFilePath())
 	}
 
-	// 信号处理
 	ctx, cancel := context.WithCancel(context.Background())
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
-	go func() {
-		<-sigCh
-		cancel()
-	}()
+	go func() { <-sigCh; cancel() }()
 
 	if *flagNative {
 		runNative(ctx, host, passcode)
@@ -74,32 +63,182 @@ func main() {
 	}
 }
 
-// runNative Go 原生模式（不需要 Node.js）
+// === 方法名映射（对标 daemon.mjs handleRequest）===
+//
+// daemon.mjs 把简短的 TCP 方法名映射到 gateway.callAPI 的 camelCase 方法名，
+// 并做参数变换。Go native 模式必须一比一还原。
+
+type apiCall struct {
+	Method string      // gateway.callAPI 的方法名
+	Params interface{} // 变换后的参数
+	Timeout time.Duration
+}
+
+// mapMethod 将 TCP JSON-RPC 方法名映射到 gateway API 调用
+// 完全对标 daemon.mjs handleRequest 的 switch 分支
+func mapMethod(method string, params json.RawMessage) apiCall {
+	const (
+		defTimeout = 10 * time.Second
+		shortTimeout = 5 * time.Second
+		longTimeout  = 15 * time.Second
+		xlongTimeout = 30 * time.Second
+	)
+
+	switch method {
+	case "auth":
+		return apiCall{"getVarList", map[string]any{"scope": "global"}, shortTimeout}
+
+	case "devices", "list_devices":
+		return apiCall{"getDevList", nil, longTimeout}
+
+	case "scenes", "list_scenes":
+		return apiCall{"getGraphList", nil, longTimeout}
+
+	case "get_graph":
+		// 参数变换：graphId/id/graph_id → id
+		var p struct {
+			GraphID  string `json:"graphId"`
+			ID       string `json:"id"`
+			GraphID2 string `json:"graph_id"`
+		}
+		json.Unmarshal(params, &p)
+		gid := p.GraphID
+		if gid == "" { gid = p.ID }
+		if gid == "" { gid = p.GraphID2 }
+		return apiCall{"getGraph", map[string]any{"id": gid}, longTimeout}
+
+	case "get_graph_list":
+		return apiCall{"getGraphList", nil, longTimeout}
+
+	case "delete_graph":
+		return apiCall{"deleteGraph", rawParams(params), defTimeout}
+
+	case "change_graph_config":
+		return apiCall{"changeGraphConfig", rawParams(params), defTimeout}
+
+	case "execute_scene":
+		// 特殊变换：scene_id → graphId, config.start = true
+		var p struct {
+			SceneID string `json:"scene_id"`
+			Start   *bool  `json:"start"`
+		}
+		json.Unmarshal(params, &p)
+		start := true
+		if p.Start != nil { start = *p.Start }
+		return apiCall{"changeGraphConfig", map[string]any{
+			"graphId": p.SceneID,
+			"config":  map[string]any{"start": start},
+		}, defTimeout}
+
+	case "get_vars":
+		var p struct{ Scope string `json:"scope"` }
+		json.Unmarshal(params, &p)
+		if p.Scope == "" { p.Scope = "global" }
+		return apiCall{"getVarList", map[string]any{"scope": p.Scope}, shortTimeout}
+
+	case "set_var":
+		var p struct {
+			Scope string `json:"scope"`
+			Name  string `json:"name"`
+			Value any    `json:"value"`
+		}
+		json.Unmarshal(params, &p)
+		if p.Scope == "" { p.Scope = "global" }
+		return apiCall{"setVarValue", map[string]any{
+			"scope": p.Scope, "id": p.Name, "value": p.Value,
+		}, shortTimeout}
+
+	case "set_graph":
+		return apiCall{"setGraph", rawParams(params), defTimeout}
+
+	case "device_specs_extra":
+		// 特殊：获取设备列表后做后处理
+		return apiCall{"getDevList", nil, longTimeout}
+
+	// === 备份管理（统一加 from: 'fds'）===
+	case "get_backup_list":
+		return apiCall{"getBackupList", map[string]any{"from": "fds"}, longTimeout}
+
+	case "create_backup":
+		return apiCall{"createBackup", wrapFds(params), xlongTimeout}
+
+	case "generate_backup":
+		return apiCall{"generateBackup", wrapFds(params), xlongTimeout}
+
+	case "download_backup":
+		return apiCall{"downloadBackup", wrapFds(params), longTimeout}
+
+	case "load_backup":
+		return apiCall{"loadBackup", rawParams(params), xlongTimeout}
+
+	case "delete_backup":
+		return apiCall{"deleteBackup", wrapFds(params), defTimeout}
+
+	case "get_backup_progress":
+		return apiCall{"getBackupProgress", wrapFds(params), longTimeout}
+
+	case "get_backup_config":
+		return apiCall{"getBackupConfig", map[string]any{"from": "fds"}, longTimeout}
+
+	case "set_backup_config":
+		return apiCall{"setBackupConfig", wrapFds(params), defTimeout}
+
+	// === 日志 ===
+	case "get_log":
+		return apiCall{"getLog", rawParams(params), longTimeout}
+
+	// === 变量高级 CRUD ===
+	case "create_var":
+		return apiCall{"createVar", rawParams(params), shortTimeout}
+
+	case "delete_var":
+		return apiCall{"deleteVar", rawParams(params), shortTimeout}
+
+	case "get_var_config":
+		return apiCall{"getVarConfig", rawParams(params), shortTimeout}
+
+	case "set_var_config":
+		return apiCall{"setVarConfig", rawParams(params), shortTimeout}
+
+	case "get_var_value":
+		return apiCall{"getVarValue", rawParams(params), shortTimeout}
+
+	case "get_var_scope_list":
+		return apiCall{"getVarScopeList", nil, shortTimeout}
+
+	default:
+		// 透传未知方法（与 daemon.mjs default 分支一致）
+		return apiCall{method, rawParams(params), defTimeout}
+	}
+}
+
+// wrapFds 备份方法的参数包装：{from: 'fds', params: ...}
+func wrapFds(params json.RawMessage) any {
+	var p any
+	json.Unmarshal(params, &p)
+	return map[string]any{"from": "fds", "params": p}
+}
+
+// rawParams 解析为 any，nil 参数返回 nil
+func rawParams(params json.RawMessage) any {
+	if len(params) == 0 {
+		return nil
+	}
+	var p any
+	json.Unmarshal(params, &p)
+	return p
+}
+
+// === Native 模式 ===
+
 func runNative(ctx context.Context, host, passcode string) {
-	// 读取配置文件
-	hermesHome := os.Getenv("HERMES_HOME")
-	if hermesHome == "" {
-		hermesHome = filepath.Join(os.Getenv("HOME"), ".hermes")
-	}
-	mihomeDir := filepath.Join(hermesHome, "mihome")
-	passcodeFile := filepath.Join(mihomeDir, "passcode")
-	hostFile := filepath.Join(mihomeDir, "host")
-
-	if host == "" {
-		host = readFileContent(hostFile)
-	}
-	if passcode == "" {
-		passcode = readFileContent(passcodeFile)
-	}
-
-	// TCP 服务器
 	ln, err := net.Listen("tcp", *flagTCPAddr)
 	if err != nil {
 		logger.Error("listen failed", "error", err)
 		os.Exit(1)
 	}
 	defer ln.Close()
-	logger.Info("TCP listening", "addr", *flagTCPAddr)
+	logger.Info("TCP listening (native mode)", "addr", *flagTCPAddr)
 
 	var (
 		conn     *native.Connection
@@ -108,7 +247,6 @@ func runNative(ctx context.Context, host, passcode string) {
 		tcpMu    sync.RWMutex
 	)
 
-	// 连接网关
 	connectGateway := func() {
 		connMu.Lock()
 		if conn != nil {
@@ -126,13 +264,10 @@ func runNative(ctx context.Context, host, passcode string) {
 			logger.Error("connect failed", "error", err)
 			return
 		}
-
 		connMu.Lock()
 		conn = c
 		connMu.Unlock()
-
-		// 广播连接事件
-		broadcast(&tcpMu, tcpConns, map[string]any{"method": "connected"})
+		broadcastTCP(&tcpMu, tcpConns, map[string]any{"method": "connected"})
 	}
 
 	if passcode != "" && host != "" {
@@ -140,25 +275,9 @@ func runNative(ctx context.Context, host, passcode string) {
 	}
 
 	// passcode 文件轮询
-	go func() {
-		t := time.NewTicker(2 * time.Second)
-		defer t.Stop()
-		for {
-			select {
-			case <-t.C:
-				newPC := readFileContent(passcodeFile)
-				if newPC != "" && newPC != passcode {
-					passcode = newPC
-					logger.Info("passcode updated from file")
-					go connectGateway()
-				}
-			case <-ctx.Done():
-				return
-			}
-		}
-	}()
+	go pollPasscode(ctx, &passcode, func() { go connectGateway() })
 
-	// TCP 接受循环
+	// TCP 接受
 	go func() {
 		for {
 			c, err := ln.Accept()
@@ -170,29 +289,23 @@ func runNative(ctx context.Context, host, passcode string) {
 					continue
 				}
 			}
-			go handleTCPClient(ctx, c, &conn, &connMu, tcpConns, &tcpMu, &host, &passcode,
-				func() { go connectGateway() }, connectGateway)
+			go handleNativeClient(ctx, c, &conn, &connMu, tcpConns, &tcpMu,
+				&host, &passcode, connectGateway)
 		}
 	}()
 
 	<-ctx.Done()
 	connMu.Lock()
-	if conn != nil {
-		conn.Close()
-	}
+	if conn != nil { conn.Close() }
 	connMu.Unlock()
 }
 
-func handleTCPClient(
-	ctx context.Context,
-	tc net.Conn,
-	conn **native.Connection,
-	connMu *sync.RWMutex,
-	tcpConns map[string]net.Conn,
-	tcpMu *sync.RWMutex,
+func handleNativeClient(
+	ctx context.Context, tc net.Conn,
+	conn **native.Connection, connMu *sync.RWMutex,
+	tcpConns map[string]net.Conn, tcpMu *sync.RWMutex,
 	host, passcode *string,
-	onSetPasscode func(),
-	onSetHost func(),
+	reconnect func(),
 ) {
 	id := fmt.Sprintf("%d_%s", time.Now().UnixNano(), tc.RemoteAddr())
 	tcpMu.Lock()
@@ -210,9 +323,8 @@ func handleTCPClient(
 
 	for scanner.Scan() {
 		line := scanner.Bytes()
-		if len(line) == 0 {
-			continue
-		}
+		if len(line) == 0 { continue }
+
 		var req struct {
 			ID     string          `json:"id"`
 			Method string          `json:"method"`
@@ -231,10 +343,9 @@ func handleTCPClient(
 			json.Unmarshal(req.Params, &p)
 			if p.Passcode != "" {
 				*passcode = p.Passcode
-				os.MkdirAll(filepath.Dir(passcodeFile()), 0755)
-				os.WriteFile(passcodeFile(), []byte(p.Passcode), 0600)
-				resp = map[string]any{"id": req.ID, "result": map[string]string{"status": "passcode_set"}}
-				onSetPasscode()
+				writeFile(passcodeFilePath(), p.Passcode, 0600)
+				resp = rpcResp(req.ID, map[string]string{"status": "passcode_set"})
+				reconnect()
 			}
 
 		case "set_host":
@@ -242,39 +353,48 @@ func handleTCPClient(
 			json.Unmarshal(req.Params, &p)
 			if p.Host != "" {
 				*host = p.Host
-				os.WriteFile(hostFile(), []byte(p.Host), 0644)
-				resp = map[string]any{"id": req.ID, "result": map[string]string{"status": "host_set", "host": p.Host}}
-				onSetHost()
+				writeFile(hostFilePath(), p.Host, 0644)
+				resp = rpcResp(req.ID, map[string]string{"status": "host_set", "host": p.Host})
+				reconnect()
 			}
 
 		case "ping":
 			connMu.RLock()
-			c := *conn
+			connected := *conn != nil
 			connMu.RUnlock()
-			connected := c != nil
-			resp = map[string]any{"id": req.ID, "result": map[string]any{
+			resp = rpcResp(req.ID, map[string]any{
 				"pong": true, "connected": connected,
 				"passcode_set": *passcode != "", "host": *host,
-			}}
+			})
 
 		case "get_config":
-			resp = map[string]any{"id": req.ID, "result": map[string]any{
+			resp = rpcResp(req.ID, map[string]any{
 				"host": *host, "passcode_set": *passcode != "",
 				"connected": *conn != nil, "tcp_addr": *flagTCPAddr, "native": true,
-			}}
+			})
+
+		case "dagre_layout":
+			// 纯计算，不依赖网关（Phase 2 暂未实现）
+			resp = rpcErr(req.ID, "dagre_layout not yet implemented in native mode")
+
+		case "get_session_keys":
+			// 返回密钥材料（调试用，Phase 2 暂未实现）
+			resp = rpcErr(req.ID, "get_session_keys not yet implemented in native mode")
 
 		default:
 			connMu.RLock()
 			c := *conn
 			connMu.RUnlock()
 			if c == nil {
-				resp = map[string]any{"id": req.ID, "error": "Not connected. Use set_passcode first."}
+				resp = rpcErr(req.ID, "Not connected. Use set_passcode first.")
 			} else {
-				result, err := c.Call(req.Method, req.Params, 15*time.Second)
+				// 方法名映射 + 参数变换（对标 daemon.mjs）
+				call := mapMethod(req.Method, req.Params)
+				result, err := c.Call(call.Method, call.Params, call.Timeout)
 				if err != nil {
-					resp = map[string]any{"id": req.ID, "error": err.Error()}
+					resp = rpcErr(req.ID, err.Error())
 				} else {
-					resp = map[string]any{"id": req.ID, "result": json.RawMessage(result)}
+					resp = rpcResp(req.ID, json.RawMessage(result))
 				}
 			}
 		}
@@ -285,6 +405,15 @@ func handleTCPClient(
 	}
 }
 
+// === 共享工具函数 ===
+
+func rpcResp(id string, result any) map[string]any {
+	return map[string]any{"id": id, "result": result}
+}
+func rpcErr(id string, err string) map[string]any {
+	return map[string]any{"id": id, "error": err}
+}
+
 func sendJSON(conn net.Conn, v any) {
 	data, _ := json.Marshal(v)
 	data = append(data, '\n')
@@ -292,7 +421,7 @@ func sendJSON(conn net.Conn, v any) {
 	conn.Write(data)
 }
 
-func broadcast(tcpMu *sync.RWMutex, tcpConns map[string]net.Conn, v any) {
+func broadcastTCP(tcpMu *sync.RWMutex, tcpConns map[string]net.Conn, v any) {
 	data, _ := json.Marshal(v)
 	data = append(data, '\n')
 	tcpMu.RLock()
@@ -302,68 +431,51 @@ func broadcast(tcpMu *sync.RWMutex, tcpConns map[string]net.Conn, v any) {
 	}
 }
 
-// runLegacy 原有 Node.js 子进程模式
-func runLegacy(ctx context.Context, host, passcode string) {
-	jsDir := *flagJsDir
-	if jsDir == "" {
-		jsDir = findJsDir()
-	}
-	if jsDir == "" {
-		logger.Error("daemon.mjs directory not found — use --jsdir or --native")
-		os.Exit(1)
-	}
-
-	// 导入 daemon 包运行
-	// 这里用 exec 方式避免循环导入
-	logger.Info("legacy mode not available in this build — use --native")
-	logger.Info("or build with: go build -tags legacy ./cmd/mgwd/")
-	os.Exit(1)
-}
-
-func findJsDir() string {
-	exe, err := os.Executable()
-	if err == nil {
-		dir := filepath.Join(filepath.Dir(exe), "mi_gateway_js")
-		if fileExists(filepath.Join(dir, "daemon.mjs")) {
-			return dir
+func pollPasscode(ctx context.Context, passcode *string, onChange func()) {
+	t := time.NewTicker(2 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-t.C:
+			newPC := readFileContent(passcodeFilePath())
+			if newPC != "" && newPC != *passcode {
+				*passcode = newPC
+				logger.Info("passcode updated from file")
+				onChange()
+			}
+		case <-ctx.Done():
+			return
 		}
 	}
-	home := os.Getenv("HOME")
-	if home != "" {
-		dir := filepath.Join(home, ".hermes", "mi_gateway_js")
-		if fileExists(filepath.Join(dir, "daemon.mjs")) {
-			return dir
-		}
-	}
-	return ""
 }
 
-func fileExists(p string) bool {
-	_, err := os.Stat(p)
-	return err == nil
+func envOrFile(envKey, filePath string) string {
+	if v := os.Getenv(envKey); v != "" {
+		return v
+	}
+	return readFileContent(filePath)
 }
 
 func readFileContent(path string) string {
 	data, err := os.ReadFile(path)
-	if err != nil {
-		return ""
-	}
-	s := string(data)
-	return strings.TrimRight(s, "\n")
+	if err != nil { return "" }
+	return strings.TrimRight(string(data), "\n")
 }
 
-func passcodeFile() string {
-	hermesHome := os.Getenv("HERMES_HOME")
-	if hermesHome == "" {
-		hermesHome = filepath.Join(os.Getenv("HOME"), ".hermes")
-	}
-	return filepath.Join(hermesHome, "mihome", "passcode")
+func writeFile(path string, content string, perm os.FileMode) {
+	os.MkdirAll(filepath.Dir(path), 0755)
+	os.WriteFile(path, []byte(content), perm)
 }
 
-func hostFile() string {
-	hermesHome := os.Getenv("HERMES_HOME")
-	if hermesHome == "" {
-		hermesHome = filepath.Join(os.Getenv("HOME"), ".hermes")
-	}
-	return filepath.Join(hermesHome, "mihome", "host")
+func hermesHome() string {
+	if h := os.Getenv("HERMES_HOME"); h != "" { return h }
+	return filepath.Join(os.Getenv("HOME"), ".hermes")
+}
+func passcodeFilePath() string { return filepath.Join(hermesHome(), "mihome", "passcode") }
+func hostFilePath() string     { return filepath.Join(hermesHome(), "mihome", "host") }
+
+// runLegacy 原有 Node.js 子进程模式
+func runLegacy(ctx context.Context, host, passcode string) {
+	logger.Error("legacy mode requires daemon package — rebuild without -tags native, or use --native")
+	os.Exit(1)
 }
