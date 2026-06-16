@@ -15,3 +15,6 @@ package-lock.json
 .vscode/
 *.swp
 *.swo
+bin/
+mgwd
+mgw-mcp
