@@ -230,6 +230,138 @@ func registerTools(s *server.MCPServer) {
 		),
 		handleCallAPI,
 	)
+
+	// === 系统管理 ===
+	s.AddTool(
+		mcp.NewTool("daemon_status",
+			mcp.WithDescription("检查 daemon 运行状态"),
+		),
+		handleDaemonStatus,
+	)
+
+	s.AddTool(
+		mcp.NewTool("get_gateway_config",
+			mcp.WithDescription("获取网关配置"),
+		),
+		handleGetGatewayConfig,
+	)
+
+	s.AddTool(
+		mcp.NewTool("clear_passcode",
+			mcp.WithDescription("清除保存的密码"),
+		),
+		handleClearPasscode,
+	)
+
+	s.AddTool(
+		mcp.NewTool("reconnect_daemon",
+			mcp.WithDescription("强制重连 daemon"),
+		),
+		handleReconnectDaemon,
+	)
+
+	// === 场景高级操作 ===
+	s.AddTool(
+		mcp.NewTool("rename_scene",
+			mcp.WithDescription("重命名场景"),
+			mcp.WithString("scene_id", mcp.Required(), mcp.Description("场景 ID")),
+			mcp.WithString("name", mcp.Required(), mcp.Description("新名称")),
+		),
+		handleRenameScene,
+	)
+
+	s.AddTool(
+		mcp.NewTool("analyze_scenes",
+			mcp.WithDescription("分析所有场景的节点类型、设备交互、连接模式"),
+			mcp.WithString("scene_id", mcp.Description("可选：只分析指定场景")),
+		),
+		handleAnalyzeScenes,
+	)
+
+	// === 变量高级操作 ===
+	s.AddTool(
+		mcp.NewTool("get_variable_details",
+			mcp.WithDescription("获取变量详情"),
+			mcp.WithString("name", mcp.Required(), mcp.Description("变量名")),
+			mcp.WithString("scope", mcp.Description("变量作用域，默认 global")),
+		),
+		handleGetVariableDetails,
+	)
+
+	s.AddTool(
+		mcp.NewTool("get_variable_scopes",
+			mcp.WithDescription("获取所有变量作用域"),
+		),
+		handleGetVariableScopes,
+	)
+
+	s.AddTool(
+		mcp.NewTool("get_variable_value",
+			mcp.WithDescription("获取变量当前值"),
+			mcp.WithString("name", mcp.Required(), mcp.Description("变量名")),
+			mcp.WithString("scope", mcp.Description("变量作用域，默认 global")),
+		),
+		handleGetVariableValue,
+	)
+
+	s.AddTool(
+		mcp.NewTool("set_variable_config",
+			mcp.WithDescription("设置变量配置"),
+			mcp.WithString("name", mcp.Required(), mcp.Description("变量名")),
+			mcp.WithString("config_json", mcp.Required(), mcp.Description("配置 JSON")),
+			mcp.WithString("scope", mcp.Description("变量作用域，默认 global")),
+		),
+		handleSetVariableConfig,
+	)
+
+	// === 设备高级操作 ===
+	s.AddTool(
+		mcp.NewTool("list_device_controls",
+			mcp.WithDescription("列出设备可控属性（siid/piid/value）"),
+			mcp.WithString("did", mcp.Required(), mcp.Description("设备 DID")),
+		),
+		handleListDeviceControls,
+	)
+
+	s.AddTool(
+		mcp.NewTool("list_device_events",
+			mcp.WithDescription("列出设备事件（siid/eiid）"),
+			mcp.WithString("did", mcp.Required(), mcp.Description("设备 DID")),
+		),
+		handleListDeviceEvents,
+	)
+
+	// === 备份高级操作 ===
+	s.AddTool(
+		mcp.NewTool("get_backup_config",
+			mcp.WithDescription("获取备份配置"),
+		),
+		handleGetBackupConfig,
+	)
+
+	s.AddTool(
+		mcp.NewTool("set_backup_config",
+			mcp.WithDescription("设置备份配置"),
+			mcp.WithString("config_json", mcp.Required(), mcp.Description("配置 JSON")),
+		),
+		handleSetBackupConfig,
+	)
+
+	s.AddTool(
+		mcp.NewTool("get_backup_progress",
+			mcp.WithDescription("获取备份进度"),
+		),
+		handleGetBackupProgress,
+	)
+
+	// === 日志 ===
+	s.AddTool(
+		mcp.NewTool("get_gateway_logs",
+			mcp.WithDescription("获取网关日志"),
+			mcp.WithString("limit", mcp.Description("日志条数，默认 50")),
+		),
+		handleGetGatewayLogs,
+	)
 }
 
 // === MCP 工具处理函数 ===
@@ -613,6 +745,255 @@ func formatResult(data json.RawMessage) *mcp.CallToolResult {
 		return mcp.NewToolResultText(string(data))
 	}
 	return mcp.NewToolResultText(pretty.String())
+}
+
+
+
+// === 系统管理处理函数 ===
+
+func handleDaemonStatus(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	result, err := daemonCall("ping", nil)
+	if err != nil {
+		return mcp.NewToolResultText(fmt.Sprintf("❌ daemon 不可达: %v", err)), nil
+	}
+	var status struct {
+		Connected   bool   `json:"connected"`
+		PasscodeSet bool   `json:"passcode_set"`
+		Host        string `json:"host"`
+	}
+	json.Unmarshal(result, &status)
+	state := "❌ 未连接"
+	if status.Connected {
+		state = "✅ 已连接"
+	}
+	pc := "❌ 未设置"
+	if status.PasscodeSet {
+		pc = "✅ 已设置"
+	}
+	return mcp.NewToolResultText(fmt.Sprintf("连接状态: %s\n密码: %s\n网关: %s", state, pc, status.Host)), nil
+}
+
+func handleGetGatewayConfig(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	result, err := daemonCall("get_config", nil)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	return formatResult(result), nil
+}
+
+func handleClearPasscode(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	home := os.Getenv("HOME")
+	pcFile := home + "/.hermes/mihome/passcode"
+	os.Remove(pcFile)
+	return mcp.NewToolResultText("✅ 密码已清除。使用 set_passcode 设置新密码。"), nil
+}
+
+func handleReconnectDaemon(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	result, err := daemonCall("ping", nil)
+	if err != nil {
+		return mcp.NewToolResultText(fmt.Sprintf("❌ daemon 不可达: %v", err)), nil
+	}
+	return mcp.NewToolResultText(fmt.Sprintf("✅ daemon 运行中: %s", string(result))), nil
+}
+
+func handleRenameScene(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	sceneID, _ := req.RequireString("scene_id")
+	newName, _ := req.RequireString("name")
+	graphResult, err := daemonCall("get_graph", map[string]any{"graphId": sceneID})
+	if err != nil {
+		return mcp.NewToolResultError("获取场景失败: " + err.Error()), nil
+	}
+	var graph map[string]any
+	json.Unmarshal(graphResult, &graph)
+	if cfg, ok := graph["cfg"].(map[string]any); ok {
+		if userData, ok := cfg["userData"].(map[string]any); ok {
+			userData["name"] = newName
+			userData["lastUpdateTime"] = time.Now().UnixMilli()
+		}
+	}
+	_, err = daemonCall("set_graph", graph)
+	if err != nil {
+		return mcp.NewToolResultError("重命名失败: " + err.Error()), nil
+	}
+	return mcp.NewToolResultText(fmt.Sprintf("✅ 场景已重命名: %s → %s", sceneID, newName)), nil
+}
+
+func handleAnalyzeScenes(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	sceneIDFilter := req.GetString("scene_id", "")
+	scenesResult, err := daemonCall("scenes", nil)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	var scenes []struct {
+		ID       string `json:"id"`
+		UserData struct {
+			Name string `json:"name"`
+		} `json:"userData"`
+		Enable bool `json:"enable"`
+	}
+	json.Unmarshal(scenesResult, &scenes)
+	var analysis []string
+	for _, sc := range scenes {
+		if sceneIDFilter != "" && sc.ID != sceneIDFilter {
+			continue
+		}
+		graphResult, err := daemonCall("get_graph", map[string]any{"graphId": sc.ID})
+		if err != nil {
+			continue
+		}
+		var graph struct {
+			Nodes []struct {
+				ID      string `json:"id"`
+				Type    string `json:"type"`
+				Outputs map[string][]string `json:"outputs"`
+			} `json:"nodes"`
+		}
+		json.Unmarshal(graphResult, &graph)
+		typeCount := make(map[string]int)
+		connCount := 0
+		for _, n := range graph.Nodes {
+			typeCount[n.Type]++
+			for _, targets := range n.Outputs {
+				connCount += len(targets)
+			}
+		}
+		status := "✅"
+		if !sc.Enable {
+			status = "⏸️"
+		}
+		line := fmt.Sprintf("%s %s (%s) — %d 节点, %d 连接",
+			status, sc.UserData.Name, sc.ID[:12], len(graph.Nodes), connCount)
+		analysis = append(analysis, line)
+		var types []string
+		for t, c := range typeCount {
+			types = append(types, fmt.Sprintf("%s×%d", t, c))
+		}
+		analysis = append(analysis, "    "+strings.Join(types, ", "))
+	}
+	if len(analysis) == 0 {
+		return mcp.NewToolResultText("没有找到场景。"), nil
+	}
+	return mcp.NewToolResultText(strings.Join(analysis, "\n")), nil
+}
+
+func handleGetVariableDetails(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	name, _ := req.RequireString("name")
+	scope := req.GetString("scope", "global")
+	result, err := daemonCall("get_var_config", map[string]any{"id": name, "scope": scope})
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	return formatResult(result), nil
+}
+
+func handleGetVariableScopes(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	result, err := daemonCall("get_var_scope_list", nil)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	return formatResult(result), nil
+}
+
+func handleGetVariableValue(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	name, _ := req.RequireString("name")
+	scope := req.GetString("scope", "global")
+	result, err := daemonCall("get_var_value", map[string]any{"id": name, "scope": scope})
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	return formatResult(result), nil
+}
+
+func handleSetVariableConfig(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	name, _ := req.RequireString("name")
+	configJSON, _ := req.RequireString("config_json")
+	scope := req.GetString("scope", "global")
+	var config any
+	if err := json.Unmarshal([]byte(configJSON), &config); err != nil {
+		return mcp.NewToolResultError("invalid config_json: " + err.Error()), nil
+	}
+	_, err := daemonCall("set_var_config", map[string]any{"id": name, "scope": scope, "config": config})
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	return mcp.NewToolResultText(fmt.Sprintf("✅ 变量配置已更新: %s", name)), nil
+}
+
+func handleListDeviceControls(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	did, _ := req.RequireString("did")
+	devResult, err := daemonCall("devices", nil)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	var devData struct {
+		DevList map[string]struct {
+			URN string `json:"urn"`
+		} `json:"devList"`
+	}
+	json.Unmarshal(devResult, &devData)
+	urn := ""
+	if dev, ok := devData.DevList[did]; ok {
+		urn = dev.URN
+	}
+	caps := getDeviceCapabilities(urn)
+	return mcp.NewToolResultText(fmt.Sprintf("设备: %s (%s)\n可控属性: %s\nURN: %s", did, caps["name"], caps["props"], urn)), nil
+}
+
+func handleListDeviceEvents(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	did, _ := req.RequireString("did")
+	devResult, err := daemonCall("devices", nil)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	var devData struct {
+		DevList map[string]struct {
+			URN string `json:"urn"`
+		} `json:"devList"`
+	}
+	json.Unmarshal(devResult, &devData)
+	urn := ""
+	if dev, ok := devData.DevList[did]; ok {
+		urn = dev.URN
+	}
+	caps := getDeviceCapabilities(urn)
+	return mcp.NewToolResultText(fmt.Sprintf("设备: %s (%s)\n事件: %s\nURN: %s", did, caps["name"], caps["events"], urn)), nil
+}
+
+func handleGetBackupConfig(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	result, err := daemonCall("get_backup_config", nil)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	return formatResult(result), nil
+}
+
+func handleSetBackupConfig(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	configJSON, _ := req.RequireString("config_json")
+	var config any
+	if err := json.Unmarshal([]byte(configJSON), &config); err != nil {
+		return mcp.NewToolResultError("invalid config_json: " + err.Error()), nil
+	}
+	_, err := daemonCall("set_backup_config", config)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	return mcp.NewToolResultText("✅ 备份配置已更新"), nil
+}
+
+func handleGetBackupProgress(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	result, err := daemonCall("get_backup_progress", nil)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	return formatResult(result), nil
+}
+
+func handleGetGatewayLogs(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	result, err := daemonCall("get_log", nil)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	return formatResult(result), nil
 }
 
 // === MiOT 设备规格数据库 ===
