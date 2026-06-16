@@ -1,0 +1,77 @@
+{
+  "场景名称": "门锁开锁→前门厅灯亮",
+  "场景描述": "当门锁开锁事件触发时，自动打开前门厅筒射灯",
+  "触发条件": {
+    "类型": "eventInput",
+    "设备": "小米智能门锁 M30 Pro (DID=1067987105)",
+    "Service": 2,
+    "Event": 1020,
+    "说明": "Lock Event — 门锁操作事件（开锁/关锁/反锁等）"
+  },
+  "执行动作": {
+    "类型": "deviceOutput",
+    "设备": "筒射灯(左) (DID=1081114455, model=yeelink.light.ml9)",
+    "Service": 2,
+    "Property": 1,
+    "Value": true,
+    "说明": "开灯 (siid=2, piid=1, value=true)"
+  },
+  "场景图JSON": {
+    "nodes": [
+      {
+        "id": "nop_desc",
+        "type": "nop",
+        "cfg": {
+          "contents": [{"insert": "🔐 门锁开锁→灯亮\n测试场景：开锁后自动打开前门厅灯"}],
+          "background": "#E3F2FD",
+          "pos": {"x": 30, "y": 30, "width": 320, "height": 80},
+          "name": "nop",
+          "version": 1,
+          "simplified": true
+        },
+        "inputs": {},
+        "outputs": {"output": ["evt_trigger.event"]},
+        "props": {}
+      },
+      {
+        "id": "evt_trigger",
+        "type": "eventInput",
+        "cfg": {
+          "pos": {"x": 30, "y": 160, "width": 320, "height": 120},
+          "name": "eventInput",
+          "version": 1,
+          "urn": "urn:miot-spec-v2:device:lock:0000A038:xiaomi-s20pro:2",
+          "simplified": true
+        },
+        "props": {
+          "did": "1067987105",
+          "siid": 2,
+          "eiid": 1020
+        },
+        "inputs": {"event": null},
+        "outputs": {"output": ["light_on.trigger"]}
+      },
+      {
+        "id": "light_on",
+        "type": "deviceOutput",
+        "cfg": {
+          "pos": {"x": 400, "y": 160, "width": 320, "height": 120},
+          "name": "deviceOutput",
+          "version": 1,
+          "urn": "urn:miot-spec-v2:device:light:0000A001:yeelink-ml9:1",
+          "simplified": true
+        },
+        "props": {
+          "did": "1081114455",
+          "siid": 2,
+          "piid": 1,
+          "value": true,
+          "dtype": "bool"
+        },
+        "inputs": {"trigger": null},
+        "outputs": {"output": []}
+      }
+    ]
+  },
+  "导入方式": "Web UI → 自动化 → 新建场景 → 导入 JSON（或手动拖拽节点）"
+}
