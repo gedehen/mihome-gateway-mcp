@@ -64,21 +64,72 @@ func main() {
 }
 
 // === 方法名映射（对标 daemon.mjs handleRequest）===
-//
-// daemon.mjs 把简短的 TCP 方法名映射到 gateway.callAPI 的 camelCase 方法名，
-// 并做参数变换。Go native 模式必须一比一还原。
 
 type apiCall struct {
-	Method string      // gateway.callAPI 的方法名
-	Params interface{} // 变换后的参数
+	Method  string
+	Params  interface{}
 	Timeout time.Duration
 }
 
-// mapMethod 将 TCP JSON-RPC 方法名映射到 gateway API 调用
-// 完全对标 daemon.mjs handleRequest 的 switch 分支
+// dtype 规范化（对标 scene_builder.py _normalize_dtype）
+var dtypeMap = map[string]string{
+	"bool":    "boolean",
+	"boolean": "boolean",
+	"int":     "int",
+	"uint8":   "uint8",
+	"uint16":  "uint16",
+	"float":   "float",
+	"string":  "string",
+}
+
+func normalizeDtype(dt string) string {
+	if v, ok := dtypeMap[dt]; ok {
+		return v
+	}
+	return dt
+}
+
+// normalizeGraphParams 规范化 setGraph 参数中的 dtype 和 operator
+func normalizeGraphParams(params json.RawMessage) interface{} {
+	var graph map[string]interface{}
+	if err := json.Unmarshal(params, &graph); err != nil {
+		return rawParams(params)
+	}
+
+	nodes, ok := graph["nodes"].([]interface{})
+	if !ok {
+		return graph
+	}
+
+	for _, n := range nodes {
+		node, ok := n.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		props, ok := node["props"].(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		// 规范化 dtype
+		if dt, ok := props["dtype"].(string); ok {
+			props["dtype"] = normalizeDtype(dt)
+		}
+
+		// 规范化 operator（== → =）
+		if op, ok := props["operator"].(string); ok {
+			if op == "==" {
+				props["operator"] = "="
+			}
+		}
+	}
+
+	return graph
+}
+
 func mapMethod(method string, params json.RawMessage) apiCall {
 	const (
-		defTimeout = 10 * time.Second
+		defTimeout  = 10 * time.Second
 		shortTimeout = 5 * time.Second
 		longTimeout  = 15 * time.Second
 		xlongTimeout = 30 * time.Second
@@ -95,7 +146,6 @@ func mapMethod(method string, params json.RawMessage) apiCall {
 		return apiCall{"getGraphList", nil, longTimeout}
 
 	case "get_graph":
-		// 参数变换：graphId/id/graph_id → id
 		var p struct {
 			GraphID  string `json:"graphId"`
 			ID       string `json:"id"`
@@ -103,8 +153,12 @@ func mapMethod(method string, params json.RawMessage) apiCall {
 		}
 		json.Unmarshal(params, &p)
 		gid := p.GraphID
-		if gid == "" { gid = p.ID }
-		if gid == "" { gid = p.GraphID2 }
+		if gid == "" {
+			gid = p.ID
+		}
+		if gid == "" {
+			gid = p.GraphID2
+		}
 		return apiCall{"getGraph", map[string]any{"id": gid}, longTimeout}
 
 	case "get_graph_list":
@@ -117,14 +171,15 @@ func mapMethod(method string, params json.RawMessage) apiCall {
 		return apiCall{"changeGraphConfig", rawParams(params), defTimeout}
 
 	case "execute_scene":
-		// 特殊变换：scene_id → graphId, config.start = true
 		var p struct {
 			SceneID string `json:"scene_id"`
 			Start   *bool  `json:"start"`
 		}
 		json.Unmarshal(params, &p)
 		start := true
-		if p.Start != nil { start = *p.Start }
+		if p.Start != nil {
+			start = *p.Start
+		}
 		return apiCall{"changeGraphConfig", map[string]any{
 			"graphId": p.SceneID,
 			"config":  map[string]any{"start": start},
@@ -133,7 +188,9 @@ func mapMethod(method string, params json.RawMessage) apiCall {
 	case "get_vars":
 		var p struct{ Scope string `json:"scope"` }
 		json.Unmarshal(params, &p)
-		if p.Scope == "" { p.Scope = "global" }
+		if p.Scope == "" {
+			p.Scope = "global"
+		}
 		return apiCall{"getVarList", map[string]any{"scope": p.Scope}, shortTimeout}
 
 	case "set_var":
@@ -143,43 +200,37 @@ func mapMethod(method string, params json.RawMessage) apiCall {
 			Value any    `json:"value"`
 		}
 		json.Unmarshal(params, &p)
-		if p.Scope == "" { p.Scope = "global" }
+		if p.Scope == "" {
+			p.Scope = "global"
+		}
 		return apiCall{"setVarValue", map[string]any{
 			"scope": p.Scope, "id": p.Name, "value": p.Value,
 		}, shortTimeout}
 
 	case "set_graph":
-		return apiCall{"setGraph", rawParams(params), defTimeout}
+		// 规范化 dtype 和 operator
+		return apiCall{"setGraph", normalizeGraphParams(params), defTimeout}
 
 	case "device_specs_extra":
-		// 特殊：获取设备列表后做后处理
 		return apiCall{"getDevList", nil, longTimeout}
 
-	// === 备份管理（统一加 from: 'fds'）===
+	// === 备份管理 ===
 	case "get_backup_list":
 		return apiCall{"getBackupList", map[string]any{"from": "fds"}, longTimeout}
-
 	case "create_backup":
 		return apiCall{"createBackup", wrapFds(params), xlongTimeout}
-
 	case "generate_backup":
 		return apiCall{"generateBackup", wrapFds(params), xlongTimeout}
-
 	case "download_backup":
 		return apiCall{"downloadBackup", wrapFds(params), longTimeout}
-
 	case "load_backup":
 		return apiCall{"loadBackup", rawParams(params), xlongTimeout}
-
 	case "delete_backup":
 		return apiCall{"deleteBackup", wrapFds(params), defTimeout}
-
 	case "get_backup_progress":
 		return apiCall{"getBackupProgress", wrapFds(params), longTimeout}
-
 	case "get_backup_config":
 		return apiCall{"getBackupConfig", map[string]any{"from": "fds"}, longTimeout}
-
 	case "set_backup_config":
 		return apiCall{"setBackupConfig", wrapFds(params), defTimeout}
 
@@ -190,36 +241,28 @@ func mapMethod(method string, params json.RawMessage) apiCall {
 	// === 变量高级 CRUD ===
 	case "create_var":
 		return apiCall{"createVar", rawParams(params), shortTimeout}
-
 	case "delete_var":
 		return apiCall{"deleteVar", rawParams(params), shortTimeout}
-
 	case "get_var_config":
 		return apiCall{"getVarConfig", rawParams(params), shortTimeout}
-
 	case "set_var_config":
 		return apiCall{"setVarConfig", rawParams(params), shortTimeout}
-
 	case "get_var_value":
 		return apiCall{"getVarValue", rawParams(params), shortTimeout}
-
 	case "get_var_scope_list":
 		return apiCall{"getVarScopeList", nil, shortTimeout}
 
 	default:
-		// 透传未知方法（与 daemon.mjs default 分支一致）
 		return apiCall{method, rawParams(params), defTimeout}
 	}
 }
 
-// wrapFds 备份方法的参数包装：{from: 'fds', params: ...}
 func wrapFds(params json.RawMessage) any {
 	var p any
 	json.Unmarshal(params, &p)
 	return map[string]any{"from": "fds", "params": p}
 }
 
-// rawParams 解析为 any，nil 参数返回 nil
 func rawParams(params json.RawMessage) any {
 	if len(params) == 0 {
 		return nil
@@ -274,10 +317,8 @@ func runNative(ctx context.Context, host, passcode string) {
 		go connectGateway()
 	}
 
-	// passcode 文件轮询
 	go pollPasscode(ctx, &passcode, func() { go connectGateway() })
 
-	// TCP 接受
 	go func() {
 		for {
 			c, err := ln.Accept()
@@ -296,7 +337,9 @@ func runNative(ctx context.Context, host, passcode string) {
 
 	<-ctx.Done()
 	connMu.Lock()
-	if conn != nil { conn.Close() }
+	if conn != nil {
+		conn.Close()
+	}
 	connMu.Unlock()
 }
 
@@ -323,7 +366,9 @@ func handleNativeClient(
 
 	for scanner.Scan() {
 		line := scanner.Bytes()
-		if len(line) == 0 { continue }
+		if len(line) == 0 {
+			continue
+		}
 
 		var req struct {
 			ID     string          `json:"id"`
@@ -374,11 +419,9 @@ func handleNativeClient(
 			})
 
 		case "dagre_layout":
-			// 纯计算，不依赖网关（Phase 2 暂未实现）
 			resp = rpcErr(req.ID, "dagre_layout not yet implemented in native mode")
 
 		case "get_session_keys":
-			// 返回密钥材料（调试用，Phase 2 暂未实现）
 			resp = rpcErr(req.ID, "get_session_keys not yet implemented in native mode")
 
 		default:
@@ -388,7 +431,6 @@ func handleNativeClient(
 			if c == nil {
 				resp = rpcErr(req.ID, "Not connected. Use set_passcode first.")
 			} else {
-				// 方法名映射 + 参数变换（对标 daemon.mjs）
 				call := mapMethod(req.Method, req.Params)
 				result, err := c.Call(call.Method, call.Params, call.Timeout)
 				if err != nil {
@@ -410,6 +452,7 @@ func handleNativeClient(
 func rpcResp(id string, result any) map[string]any {
 	return map[string]any{"id": id, "result": result}
 }
+
 func rpcErr(id string, err string) map[string]any {
 	return map[string]any{"id": id, "error": err}
 }
@@ -458,7 +501,9 @@ func envOrFile(envKey, filePath string) string {
 
 func readFileContent(path string) string {
 	data, err := os.ReadFile(path)
-	if err != nil { return "" }
+	if err != nil {
+		return ""
+	}
 	return strings.TrimRight(string(data), "\n")
 }
 
@@ -467,16 +512,14 @@ func writeFile(path string, content string, perm os.FileMode) {
 	os.WriteFile(path, []byte(content), perm)
 }
 
-// hermesHome 返回根 hermes 目录（~/.hermes）
-// mihome 配置文件始终在根目录，不在 profile 子目录
 func hermesHome() string {
 	return filepath.Join(os.Getenv("HOME"), ".hermes")
 }
+
 func passcodeFilePath() string { return filepath.Join(hermesHome(), "mihome", "passcode") }
 func hostFilePath() string     { return filepath.Join(hermesHome(), "mihome", "host") }
 
-// runLegacy 原有 Node.js 子进程模式
 func runLegacy(ctx context.Context, host, passcode string) {
-	logger.Error("legacy mode requires daemon package — rebuild without -tags native, or use --native")
+	logger.Error("legacy mode requires daemon package — use --native")
 	os.Exit(1)
 }
