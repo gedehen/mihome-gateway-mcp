@@ -1,16 +1,23 @@
-// Package native — 场景图自动布局算法
+// Package native — 场景图自动布局
 //
-// Sugiyama 分层布局：bfs 分层 + barycenter 列分配 + 坐标计算
-// 对标 Python auto_layout.py 的本地 fallback 算法
+// 优先通过 subprocess 调用 dagre (Node.js)，fallback 到本地 Sugiyama 算法。
 package native
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"log/slog"
 	"math"
+	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 )
 
-// 卡片尺寸表（对标 Python SIZE）
+// 卡片尺寸表
 var cardSizes = map[string][2]int{
 	"onLoad":            {160, 98},
 	"loop":              {160, 98},
@@ -40,7 +47,6 @@ var cardSizes = map[string][2]int{
 	"varSetString":      {180, 80},
 }
 
-// 默认列顺序（对标 Python TYPE_COL）
 var typeCol = map[string]int{
 	"onLoad": 0, "loop": 0, "alarmClock": 0, "nop": 0,
 	"deviceInput": 1, "deviceGet": 1, "deviceGetSetVar": 1, "deviceInputSetVar": 1,
@@ -62,7 +68,7 @@ func GetCardDimensions(nodeType string) (int, int) {
 	return 280, 120
 }
 
-// SceneNode 场景节点（简化版，用于布局计算）
+// SceneNode 场景节点
 type SceneNode struct {
 	ID      string                 `json:"id"`
 	Type    string                 `json:"type"`
@@ -71,25 +77,167 @@ type SceneNode struct {
 	Outputs map[string][]string    `json:"outputs"`
 }
 
-// LayoutNodes 自动布局场景节点（原地修改 cfg.pos）
-func LayoutNodes(nodes []*SceneNode) {
+// LayoutConfig 布局配置
+type LayoutConfig struct {
+	JsDir string    // dagre-layout.mjs 所在目录
+	Node  string    // node 二进制路径
+	Log   *slog.Logger
+}
+
+// LayoutNodes 自动布局场景节点
+// 优先用 dagre，fallback 到本地 Sugiyama
+func LayoutNodes(nodes []*SceneNode, cfg LayoutConfig) {
 	if len(nodes) == 0 {
 		return
 	}
 
-	// 构建拓扑
+	// 尝试 dagre
+	if cfg.JsDir != "" {
+		if err := layoutDagre(nodes, cfg); err == nil {
+			return
+		}
+		if cfg.Log != nil {
+			cfg.Log.Debug("dagre layout failed, falling back to local algorithm")
+		}
+	}
+
+	// fallback: 本地 Sugiyama
+	layoutSugiyama(nodes)
+}
+
+// === dagre 布局（通过 subprocess）===
+
+type dagreInput struct {
+	Nodes []dagreNode `json:"nodes"`
+	Edges []dagreEdge `json:"edges"`
+}
+
+type dagreNode struct {
+	ID     string `json:"id"`
+	Width  int    `json:"width"`
+	Height int    `json:"height"`
+}
+
+type dagreEdge struct {
+	From string `json:"from"`
+	To   string `json:"to"`
+}
+
+type dagreOutput struct {
+	Positions map[string]dagrePos `json:"positions"`
+	Error     string              `json:"error"`
+}
+
+type dagrePos struct {
+	X      int `json:"x"`
+	Y      int `json:"y"`
+	Width  int `json:"width"`
+	Height int `json:"height"`
+}
+
+func layoutDagre(nodes []*SceneNode, cfg LayoutConfig) error {
+	// 构建 dagre 输入
+	input := dagreInput{}
+	nodeSet := make(map[string]bool)
+	for _, n := range nodes {
+		nodeSet[n.ID] = true
+		w, h := GetCardDimensions(n.Type)
+		// 从 cfg.pos 获取实际尺寸（如果有）
+		if pos, ok := n.Cfg["pos"].(map[string]interface{}); ok {
+			if pw, ok := pos["width"].(float64); ok && pw > 0 {
+				w = int(pw)
+			}
+			if ph, ok := pos["height"].(float64); ok && ph > 0 {
+				h = int(ph)
+			}
+		}
+		input.Nodes = append(input.Nodes, dagreNode{ID: n.ID, Width: w, Height: h})
+	}
+
+	// 提取边
+	for _, n := range nodes {
+		for _, targets := range n.Outputs {
+			for _, t := range targets {
+				tid := t
+				if idx := strings.Index(t, "."); idx >= 0 {
+					tid = t[:idx]
+				}
+				if nodeSet[tid] {
+					input.Edges = append(input.Edges, dagreEdge{From: n.ID, To: tid})
+				}
+			}
+		}
+	}
+
+	inputJSON, err := json.Marshal(input)
+	if err != nil {
+		return err
+	}
+
+	// 找 node 二进制
+	nodeBin := cfg.Node
+	if nodeBin == "" {
+		nodeBin, err = exec.LookPath("node")
+		if err != nil {
+			return fmt.Errorf("node not found: %w", err)
+		}
+	}
+
+	scriptPath := filepath.Join(cfg.JsDir, "dagre-layout.mjs")
+
+	// 调用 subprocess
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, nodeBin, scriptPath)
+	cmd.Stdin = bytes.NewReader(inputJSON)
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("dagre subprocess: %w, stderr: %s", err, stderr.String())
+	}
+
+	// 解析输出
+	var output dagreOutput
+	if err := json.Unmarshal(stdout.Bytes(), &output); err != nil {
+		return fmt.Errorf("parse dagre output: %w", err)
+	}
+	if output.Error != "" {
+		return fmt.Errorf("dagre error: %s", output.Error)
+	}
+
+	// 应用位置
+	for _, n := range nodes {
+		if pos, ok := output.Positions[n.ID]; ok {
+			if n.Cfg == nil {
+				n.Cfg = make(map[string]interface{})
+			}
+			n.Cfg["pos"] = map[string]interface{}{
+				"x":      pos.X,
+				"y":      pos.Y,
+				"width":  pos.Width,
+				"height": pos.Height,
+			}
+		}
+	}
+
+	return nil
+}
+
+// === 本地 Sugiyama 布局（fallback）===
+
+func layoutSugiyama(nodes []*SceneNode) {
 	forward, backward := buildTopology(nodes)
-
-	// BFS 分层
 	layer := assignLayers(nodes, backward)
-
-	// barycenter 列分配
 	colAssign := assignColumns(nodes, layer, forward, backward)
 
-	// 动态间距
 	sizes := make([][2]int, len(nodes))
 	for i, n := range nodes {
-		w, h := GetCardDimensions(n.Type); sizes[i] = [2]int{w, h}
+		w, h := GetCardDimensions(n.Type)
+		sizes[i] = [2]int{w, h}
 	}
 	maxW, maxH, sumH := 0, 0, 0
 	for _, s := range sizes {
@@ -106,46 +254,33 @@ func LayoutNodes(nodes []*SceneNode) {
 	gapX := math.Max(30, float64(maxW)*0.15)
 	gapY := math.Max(20, avgH*0.2)
 	cellPad := math.Max(20, float64(maxW)*0.1)
-
 	cellW := float64(maxW) + gapX
 	cellH := float64(maxH) + gapY
 
-	// 计算坐标
 	for _, n := range nodes {
 		w, h := GetCardDimensions(n.Type)
 		lv := layer[n.ID]
 		cl := colAssign[n.ID]
 
-		cellX := cellPad + float64(cl)*cellW
-		x := cellX + (cellW-float64(w))/2
+		x := cellPad + float64(cl)*cellW + (cellW-float64(w))/2
+		y := cellPad + float64(lv)*cellH + (cellH-float64(h))/2
 
-		cellY := cellPad + float64(lv)*cellH
-		y := cellY + (cellH-float64(h))/2
-
-		// 写入 cfg.pos
 		if n.Cfg == nil {
 			n.Cfg = make(map[string]interface{})
 		}
-		pos := map[string]interface{}{
-			"x":      int(x),
-			"y":      int(y),
-			"width":  w,
-			"height": h,
+		n.Cfg["pos"] = map[string]interface{}{
+			"x": int(x), "y": int(y), "width": w, "height": h,
 		}
-		n.Cfg["pos"] = pos
 	}
 }
 
-// buildTopology 构建前驱/后继关系
 func buildTopology(nodes []*SceneNode) (forward, backward map[string][]string) {
 	nodeSet := make(map[string]bool)
 	for _, n := range nodes {
 		nodeSet[n.ID] = true
 	}
-
 	forward = make(map[string][]string)
 	backward = make(map[string][]string)
-
 	for _, n := range nodes {
 		for _, targets := range n.Outputs {
 			for _, t := range targets {
@@ -163,7 +298,6 @@ func buildTopology(nodes []*SceneNode) (forward, backward map[string][]string) {
 	return
 }
 
-// assignLayers BFS 分层：无入边 = layer0, 下游递增
 func assignLayers(nodes []*SceneNode, backward map[string][]string) map[string]int {
 	forward := make(map[string][]string)
 	nodeSet := make(map[string]bool)
@@ -188,7 +322,6 @@ func assignLayers(nodes []*SceneNode, backward map[string][]string) map[string]i
 	visited := make(map[string]bool)
 	queue := []string{}
 
-	// 无入边的节点 = layer 0
 	for _, n := range nodes {
 		if len(backward[n.ID]) == 0 {
 			layer[n.ID] = 0
@@ -197,7 +330,6 @@ func assignLayers(nodes []*SceneNode, backward map[string][]string) map[string]i
 		}
 	}
 
-	// BFS
 	for len(queue) > 0 {
 		curr := queue[0]
 		queue = queue[1:]
@@ -215,7 +347,6 @@ func assignLayers(nodes []*SceneNode, backward map[string][]string) map[string]i
 		}
 	}
 
-	// 未访问的节点（环）设为 layer 0
 	for _, n := range nodes {
 		if _, ok := layer[n.ID]; !ok {
 			layer[n.ID] = 0
@@ -224,13 +355,10 @@ func assignLayers(nodes []*SceneNode, backward map[string][]string) map[string]i
 	return layer
 }
 
-// assignColumns barycenter 启发式列分配
 func assignColumns(nodes []*SceneNode, layer map[string]int, forward, backward map[string][]string) map[string]int {
-	// 按层分组
 	byLayer := make(map[int][]*SceneNode)
 	for _, n := range nodes {
-		lv := layer[n.ID]
-		byLayer[lv] = append(byLayer[lv], n)
+		byLayer[layer[n.ID]] = append(byLayer[layer[n.ID]], n)
 	}
 
 	colAssign := make(map[string]int)
@@ -252,7 +380,6 @@ func assignColumns(nodes []*SceneNode, layer map[string]int, forward, backward m
 			occupied[lv] = make(map[int]bool)
 		}
 
-		// 计算期望列
 		type desired struct {
 			nid string
 			col int
@@ -271,18 +398,16 @@ func assignColumns(nodes []*SceneNode, layer map[string]int, forward, backward m
 				}
 				if len(predCols) > 0 {
 					sort.Ints(predCols)
-					d = predCols[len(predCols)/2] // median
+					d = predCols[len(predCols)/2]
 				}
 			}
 			desiredList = append(desiredList, desired{n.ID, d})
 		}
 
-		// 按期望列排序
 		sort.Slice(desiredList, func(i, j int) bool {
 			return desiredList[i].col < desiredList[j].col
 		})
 
-		// 分配列
 		for _, dd := range desiredList {
 			c := nextFree(lv, dd.col, occupied)
 			colAssign[dd.nid] = c
@@ -292,7 +417,6 @@ func assignColumns(nodes []*SceneNode, layer map[string]int, forward, backward m
 	return colAssign
 }
 
-// nextFree 从左到右找最近的空闲列
 func nextFree(layer, desired int, occupied map[int]map[int]bool) int {
 	col := desired
 	if col < 0 {
@@ -304,6 +428,5 @@ func nextFree(layer, desired int, occupied map[int]map[int]bool) int {
 		}
 		col++
 	}
-	// 极端情况
 	return col
 }
