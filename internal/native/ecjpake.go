@@ -198,8 +198,11 @@ func (e *ECJPAKE) ReadRoundTwo(data []byte) ([]byte, error) {
 
 // === 辅助函数 ===
 
-func genKeyPair() (privX, pubX, pubY *big.Int) {
-	priv, _ := secp256k1.GeneratePrivateKey()
+func genKeyPair() (privX, pubX, pubY *big.Int) { //nolint:all
+	priv, err := secp256k1.GeneratePrivateKey()
+	if err != nil {
+		panic("secp256k1 keygen failed: " + err.Error())
+	}
 	pub := priv.PubKey()
 	b := priv.Key.Bytes()
 	return new(big.Int).SetBytes(b[:]), pub.X(), pub.Y()
@@ -216,7 +219,9 @@ func ecMul(x, y *big.Int, k *big.Int) (*big.Int, *big.Int) {
 
 func randomNPlusSecret(secret *big.Int) *big.Int {
 	b := make([]byte, 16)
-	rand.Read(b)
+	if _, err := rand.Read(b); err != nil {
+		panic("crypto/rand failed: " + err.Error())
+	}
 	r := new(big.Int).SetBytes(b)
 	n := new(big.Int).Mul(r, curve.N)
 	n.Add(n, secret)
@@ -267,7 +272,9 @@ func padTo32(b []byte) []byte {
 
 func schnorrZKP(gx, gy, pubX, pubY, priv *big.Int, role string) []byte {
 	vBytes := make([]byte, 32)
-	rand.Read(vBytes)
+	if _, err := rand.Read(vBytes); err != nil {
+		panic("crypto/rand failed: " + err.Error())
+	}
 	v := new(big.Int).SetBytes(vBytes)
 	v.Mod(v, curve.N)
 	if v.Sign() == 0 {

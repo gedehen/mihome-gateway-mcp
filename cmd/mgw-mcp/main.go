@@ -1,14 +1,15 @@
-// mihome-mcp — Go MCP Server for Mi Home Gateway
+// mgw-mcp — Go MCP Server for Mi Home Gateway
 //
-// 通过 TCP JSON-RPC 连接到 mihome-daemon，暴露 MCP 工具给 AI agent。
+// 通过 TCP JSON-RPC 连接到 mgwd，暴露 MCP 工具给 AI agent。
 //
 // 用法:
 //
-//	mihome-mcp                              # stdio 模式（Hermes/agent 直接调用）
-//	mihome-mcp --daemon-addr 127.0.0.1:19345
+//	mgw-mcp                              # stdio 模式（Hermes/agent 直接调用）
+//	mgw-mcp --daemon-addr 127.0.0.1:19345
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -31,7 +32,7 @@ var (
 	flagVerbose    = flag.Bool("v", false, "verbose logging")
 )
 
-var log *slog.Logger
+var logger *slog.Logger
 
 func main() {
 	flag.Parse()
@@ -40,7 +41,7 @@ func main() {
 	if *flagVerbose {
 		level = slog.LevelDebug
 	}
-	log = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
+	logger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
 
 	s := server.NewMCPServer(
 		"mihome-gateway",
@@ -51,18 +52,15 @@ func main() {
 	registerTools(s)
 
 	// 信号处理
-	ctx, cancel := context.WithCancel(context.Background())
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
 	go func() {
 		<-sigCh
-		cancel()
 		os.Exit(0)
 	}()
-	_ = ctx
 
 	if err := server.ServeStdio(s); err != nil {
-		log.Error("server exited", "error", err)
+		logger.Error("server exited", "error", err)
 		os.Exit(1)
 	}
 }
@@ -272,7 +270,7 @@ func handleCallAPI(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolR
 func daemonCall(method string, params any) (json.RawMessage, error) {
 	conn, err := net.DialTimeout("tcp", *flagDaemonAddr, 5*time.Second)
 	if err != nil {
-		return nil, fmt.Errorf("daemon not reachable at %s — is mihome-daemon running? %w", *flagDaemonAddr, err)
+		return nil, fmt.Errorf("daemon not reachable at %s — is mgwd running? %w", *flagDaemonAddr, err)
 	}
 	defer conn.Close()
 
@@ -291,17 +289,18 @@ func daemonCall(method string, params any) (json.RawMessage, error) {
 		return nil, fmt.Errorf("write to daemon: %w", err)
 	}
 
+	// 用 scanner 逐行读取，取最后一个有 id 的响应
 	conn.SetReadDeadline(time.Now().Add(15 * time.Second))
-	buf := make([]byte, 512*1024)
-	n, err := conn.Read(buf)
-	if err != nil {
-		return nil, fmt.Errorf("read from daemon: %w", err)
-	}
+	scanner := bufio.NewScanner(conn)
+	scanner.Buffer(make([]byte, 512*1024), 512*1024)
 
-	// 解析最后一个有 id 的 JSON 行作为响应
-	lines := strings.Split(strings.TrimSpace(string(buf[:n])), "\n")
-	for i := len(lines) - 1; i >= 0; i-- {
-		line := strings.TrimSpace(lines[i])
+	var lastResp *struct {
+		ID     string          `json:"id"`
+		Result json.RawMessage `json:"result"`
+		Error  string          `json:"error"`
+	}
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
 		if line == "" {
 			continue
 		}
@@ -311,14 +310,17 @@ func daemonCall(method string, params any) (json.RawMessage, error) {
 			Error  string          `json:"error"`
 		}
 		if err := json.Unmarshal([]byte(line), &resp); err == nil && resp.ID != "" {
-			if resp.Error != "" {
-				return nil, fmt.Errorf("daemon error: %s", resp.Error)
-			}
-			return resp.Result, nil
+			lastResp = &resp
 		}
 	}
 
-	return nil, fmt.Errorf("no valid response from daemon")
+	if lastResp == nil {
+		return nil, fmt.Errorf("no valid response from daemon")
+	}
+	if lastResp.Error != "" {
+		return nil, fmt.Errorf("daemon error: %s", lastResp.Error)
+	}
+	return lastResp.Result, nil
 }
 
 func formatResult(data json.RawMessage) *mcp.CallToolResult {

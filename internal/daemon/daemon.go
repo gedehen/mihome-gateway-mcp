@@ -14,6 +14,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -69,7 +70,6 @@ type Daemon struct {
 const (
 	reconnectMin = 3 * time.Second
 	reconnectMax = 30 * time.Second
-	keepaliveInt = 25 * time.Second
 	passcodePoll = 2 * time.Second
 	maxReconnect = 5
 	rpcTimeout   = 15 * time.Second
@@ -133,7 +133,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	go d.eventLoop(ctx)
 
 	<-ctx.Done()
+	d.mu.Lock()
 	d.shuttingDown = true
+	d.mu.Unlock()
 	if d.gw != nil {
 		d.gw.Stop()
 	}
@@ -142,6 +144,13 @@ func (d *Daemon) Run(ctx context.Context) error {
 
 // connectGateway 启动 daemon.mjs 子进程
 func (d *Daemon) connectGateway(ctx context.Context) {
+	d.mu.RLock()
+	shutting := d.shuttingDown
+	d.mu.RUnlock()
+	if shutting {
+		return
+	}
+
 	if d.passcode == "" || d.host == "" {
 		d.broadcast(map[string]any{"method": "status", "message": "host/passcode not configured"})
 		return
@@ -176,7 +185,6 @@ func (d *Daemon) connectGateway(ctx context.Context) {
 	d.gw = gw
 	d.gwEvents = gw.Events()
 
-	// daemon.mjs stdin 模式启动后会自动连接，等 connected 事件
 	d.logger.Info("gateway subprocess started, waiting for connection")
 }
 
@@ -208,7 +216,7 @@ func (d *Daemon) handleGatewayEvent(ctx context.Context, evt gateway.Event) {
 	case "disconnected":
 		d.mu.Lock()
 		d.connected = false
-		authFailed := evt.Error != "" && (contains(evt.Error, "expired") || contains(evt.Error, "Authentication"))
+		authFailed := evt.Error != "" && (strings.Contains(evt.Error, "expired") || strings.Contains(evt.Error, "Authentication"))
 		d.mu.Unlock()
 		d.broadcast(map[string]any{"method": "disconnected", "error": evt.Error})
 		if authFailed {
@@ -218,7 +226,7 @@ func (d *Daemon) handleGatewayEvent(ctx context.Context, evt gateway.Event) {
 		}
 
 	case "passcode_updated", "passcode_saved", "status", "connecting":
-		d.broadcast(evt.Raw) // 原样转发
+		d.broadcast(evt.Raw)
 
 	default:
 		d.broadcast(evt.Raw)
@@ -233,8 +241,8 @@ func (d *Daemon) scheduleReconnect(ctx context.Context) {
 	if n > maxReconnect {
 		d.logger.Warn("max reconnect attempts reached, waiting for new passcode")
 		d.broadcast(map[string]any{
-			"method":  "disconnected",
-			"error":   fmt.Sprintf("reconnect failed after %d attempts — passcode may have expired", maxReconnect),
+			"method": "disconnected",
+			"error":  fmt.Sprintf("reconnect failed after %d attempts — passcode may have expired", maxReconnect),
 		})
 		return
 	}
@@ -265,34 +273,14 @@ func (d *Daemon) passcodePoller(ctx context.Context) {
 			}
 			d.mu.Lock()
 			d.passcode = c
+			d.reconnectN = 0
 			d.mu.Unlock()
 			d.logger.Info("passcode updated from file")
 			d.broadcast(map[string]any{"method": "passcode_updated"})
 			if d.gw != nil {
 				d.gw.Stop()
 			}
-			d.reconnectN = 0
 			d.connectGateway(ctx)
-		case <-ctx.Done():
-			return
-		}
-	}
-}
-
-// keepaliveLoop 定期心跳（已由 daemon.mjs 内部 keepalive 处理，Go 侧仅做监控）
-func (d *Daemon) keepaliveLoop(ctx context.Context) {
-	t := time.NewTicker(keepaliveInt)
-	defer t.Stop()
-	for {
-		select {
-		case <-t.C:
-			if !d.isConnected() || d.gw == nil {
-				continue
-			}
-			_, err := d.gw.Call("ping", nil, 5*time.Second)
-			if err != nil {
-				d.logger.Warn("keepalive failed", "error", err)
-			}
 		case <-ctx.Done():
 			return
 		}
@@ -417,7 +405,6 @@ func (d *Daemon) forwardToGateway(req RPCRequest) RPCResponse {
 	if !d.isConnected() || d.gw == nil {
 		return RPCResponse{ID: req.ID, Error: "Not connected. Use set_passcode first."}
 	}
-	// 直接透传方法名和参数 — daemon.mjs stdin 模式已接受这些方法名
 	result, err := d.gw.Call(req.Method, req.Params, rpcTimeout)
 	if err != nil {
 		return RPCResponse{ID: req.ID, Error: err.Error()}
@@ -463,17 +450,4 @@ func readFile(path string) string {
 		s = s[:len(s)-1]
 	}
 	return s
-}
-
-func contains(s, sub string) bool {
-	return len(s) >= len(sub) && (s == sub || len(s) > 0 && findSubstring(s, sub))
-}
-
-func findSubstring(s, sub string) bool {
-	for i := 0; i <= len(s)-len(sub); i++ {
-		if s[i:i+len(sub)] == sub {
-			return true
-		}
-	}
-	return false
 }

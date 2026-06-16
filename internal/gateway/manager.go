@@ -236,10 +236,10 @@ func (m *Manager) Stop() {
 	m.running = false
 	m.stdin = nil
 
-	// 清理 pending
+	// 清理 pending — 发送错误而非 close，避免接收方拿到零值
 	m.pendingMu.Lock()
 	for id, ch := range m.pendingMap {
-		close(ch)
+		ch <- Event{Error: "gateway stopped"}
 		delete(m.pendingMap, id)
 	}
 	m.pendingMu.Unlock()
@@ -300,6 +300,9 @@ func (m *Manager) readLoop(r io.Reader) {
 	m.mu.Lock()
 	m.running = false
 	m.mu.Unlock()
+	if err := scanner.Err(); err != nil {
+		m.logger.Error("stdout read error", "error", err)
+	}
 	m.logger.Info("daemon.mjs stdout closed")
 }
 

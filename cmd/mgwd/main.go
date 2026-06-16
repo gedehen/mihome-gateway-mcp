@@ -32,7 +32,6 @@ var (
 )
 
 func main() {
-	flag.Parse()
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "mgwd — Go rewrite of Mi Home Gateway daemon\n\n")
 		fmt.Fprintf(os.Stderr, "Usage:\n")
